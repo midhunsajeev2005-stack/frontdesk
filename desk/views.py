@@ -1,13 +1,21 @@
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth import get_user_model
-from django.http import Http404, HttpResponseBadRequest
+from django.db import DatabaseError
+from django.http import Http404, HttpResponse, HttpResponseBadRequest
 from django.shortcuts import render, redirect
-from django.utils import timezone
 from django.views.decorators.http import require_http_methods
-from .store import rows, create, change, close_waiting
+from .store import rows, create, change, close_waiting, late_reasons, database_now
 
 PUBLIC_EVENTS = ("Created","Agent reply","Customer reply","Reopened","Resolved","Closed after customer inactivity","Waiting for customer")
 SELECT = "SELECT t.*, u.username AS agent FROM fd_ticket t LEFT JOIN auth_user u ON u.id=t.owner"
+
+@require_http_methods(["GET", "HEAD"])
+def health(request):
+    try:
+        rows("SELECT 1")
+    except DatabaseError:
+        return HttpResponse("unavailable", status=503, content_type="text/plain")
+    return HttpResponse("ok", content_type="text/plain")
 
 @login_required
 @require_http_methods(["GET","POST"])
@@ -29,9 +37,9 @@ def inbox(request):
         return redirect("ticket",pk=create(customer,subject,priority,user.pk))
     tickets = rows(SELECT+" ORDER BY t.id DESC") if user.is_staff else rows(SELECT+" WHERE t.customer=%s ORDER BY t.id DESC",(user.pk,))
     selected = request.GET.get("show","all")
+    now = database_now()
     for t in tickets:
-        now = timezone.now()
-        t["late"] = t["state"] == "open" and (now>t["fix_due"] or (not t["first_reply"] and now>t["reply_due"]))
+        t["late"] = late_reasons(t, now)
     if selected == "late":
         tickets = [t for t in tickets if t["late"]]
     elif selected == "mine" and user.is_staff:
@@ -61,6 +69,7 @@ def ticket(request, pk):
         except ValueError as exc:
             error = str(exc)
             found = rows(SELECT+" WHERE t.id=%s",(pk,))
+    found[0]["late"] = late_reasons(found[0], database_now())
     sql = "SELECT e.kind,e.body,e.happened,u.username FROM fd_event e LEFT JOIN auth_user u ON u.id=e.actor WHERE e.ticket=%s"
     params = [pk]
     if not user.is_staff:

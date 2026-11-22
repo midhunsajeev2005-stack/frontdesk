@@ -1,5 +1,5 @@
 from django.db import connection, transaction
-from django.utils import timezone
+from django.utils.timezone import localtime
 from datetime import timedelta
 from .calendar import DAY, add_work, worked, deadlines
 
@@ -11,12 +11,33 @@ def rows(sql, params=()):
         keys = [field[0] for field in cursor.description]
         return [dict(zip(keys, row)) for row in cursor.fetchall()]
 
+def database_now():
+    return rows("SELECT clock_timestamp() AS moment")[0]["moment"]
+
+def late_reasons(t, now):
+    cutoff = t["waiting_since"] or t["finished"] or now
+    reasons = []
+    if t["first_reply"] and t["first_reply"] > t["reply_due"]:
+        reasons.append("First reply sent after its deadline")
+    elif not t["first_reply"] and cutoff > t["reply_due"]:
+        reasons.append("First reply deadline passed without a public agent reply")
+    if t["state"] != "closed" and cutoff > t["fix_due"]:
+        reasons.append("Resolved after its deadline" if t["state"] == "resolved"
+                       else "Resolution deadline passed while the ticket was open")
+    return reasons
+
+def target_summary(ticket, now):
+    t = ticket.copy()
+    advance_clocks(t, now)
+    return (f"{t['priority']} (first reply due {localtime(t['reply_due']).isoformat()}, "
+            f"resolution due {localtime(t['fix_due']).isoformat()})")
+
 def event(ticket, actor, now, kind, body=""):
     rows("INSERT INTO fd_event(ticket,actor,happened,kind,body) VALUES (%s,%s,%s,%s,%s)",(ticket,actor,now,kind,body))
 
 @transaction.atomic
 def create(customer, subject, priority, actor):
-    now = timezone.now()
+    now = database_now()
     reply, fix = deadlines(now, priority)
     ticket = rows("INSERT INTO fd_ticket(customer,subject,priority,created,reply_due,fix_due) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",(customer,subject,priority,now,reply,fix))[0]["id"]
     event(ticket,actor,now,"Created")
@@ -35,7 +56,7 @@ def change(pk, user, action, body=""):
     if not records:
         raise ValueError("Ticket unavailable.")
     t = records[0]
-    now = timezone.now()
+    now = database_now()
     if not user.is_staff and t["customer"] != user.pk:
         raise ValueError("Ticket unavailable.")
     if action == "claim" and user.is_staff and t["owner"] is None and t["state"] == "open":
@@ -68,6 +89,7 @@ def change(pk, user, action, body=""):
             t["state"], t["finished"], t["waiting_since"] = "resolved", now, None
             kind = "Resolved"
         elif action == "priority" and body in ("urgent","medium","low") and body != t["priority"]:
+            previous = target_summary(t, now)
             t["priority"] = body
             reply, t["fix_due"] = deadlines(now,body)
             if not t["first_reply"]:
@@ -80,6 +102,7 @@ def change(pk, user, action, body=""):
                 if not t["first_reply"]:
                     t["reply_due"] = add_work(start,reply_remaining)
                 t["fix_due"] = add_work(start,fix_remaining)
+            body = f"{previous} → {target_summary(t, now)}"
             kind = "Priority changed"
         else:
             raise ValueError("This action is unavailable.")
@@ -90,7 +113,7 @@ def change(pk, user, action, body=""):
 
 @transaction.atomic
 def close_waiting():
-    now = timezone.now()
+    now = database_now()
     for t in rows("SELECT id,waiting_since FROM fd_ticket WHERE state='waiting' FOR UPDATE"):
         due = add_work(t["waiting_since"], 5*DAY)
         if now >= due:
